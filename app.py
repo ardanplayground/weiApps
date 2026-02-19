@@ -1,6 +1,7 @@
 import streamlit as st
 from PIL import Image
 import numpy as np
+import struct
 import io
 import os
 
@@ -41,8 +42,8 @@ DEFAULT_PRESETS = {
     "ST7735 160x128": {"width": 160, "height": 128, "bit_depth": 16, "max_kb": 80},
     "ILI9341 320x240": {"width": 320, "height": 240, "bit_depth": 16, "max_kb": 300},
     "ILI9341 240x240": {"width": 240, "height": 240, "bit_depth": 16, "max_kb": 200},
-    "SSD1306 128x64": {"width": 128, "height": 64, "bit_depth": 16, "max_kb": 32},
-    "Custom": {"width": 320, "height": 320, "bit_depth": 16, "max_kb": 500},
+    "SSD1306 128x64":  {"width": 128, "height":  64, "bit_depth": 16, "max_kb": 32},
+    "Custom":          {"width": 320, "height": 320, "bit_depth": 16, "max_kb": 500},
 }
 
 if "presets" not in st.session_state:
@@ -50,72 +51,134 @@ if "presets" not in st.session_state:
 if "selected_preset" not in st.session_state:
     st.session_state.selected_preset = "ILI9341 320x240"
 
-# ── Core Functions ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# BMP ENCODERS
+# Pillow's .save(format="BMP") always writes 24-bit headers.
+# We write the BMP file manually using struct to guarantee biBitCount=16.
+# ══════════════════════════════════════════════════════════════════════════════
 
-def apply_rgb565(img: Image.Image) -> Image.Image:
-    arr = np.array(img.convert("RGB"), dtype=np.uint8)
-    arr[:, :, 0] = (arr[:, :, 0] >> 3) << 3
-    arr[:, :, 1] = (arr[:, :, 1] >> 2) << 2
-    arr[:, :, 2] = (arr[:, :, 2] >> 3) << 3
-    return Image.fromarray(arr, "RGB")
+def encode_bmp_16bit(img: Image.Image) -> bytes:
+    """
+    Write a true 16-bit RGB565 BMP (BI_BITFIELDS, biBitCount=16).
+    This satisfies any validator that checks 'bit depth must be 16'.
+    """
+    rgb = np.array(img.convert("RGB"), dtype=np.uint8)
+    h, w = rgb.shape[:2]
 
-def to_bmp_bytes(img: Image.Image) -> bytes:
+    # Pack each pixel into RGB565 uint16 (little-endian)
+    r = (rgb[:, :, 0].astype(np.uint16) >> 3) & 0x1F   # 5 bits  → bits 15-11
+    g = (rgb[:, :, 1].astype(np.uint16) >> 2) & 0x3F   # 6 bits  → bits 10-5
+    b = (rgb[:, :, 2].astype(np.uint16) >> 3) & 0x1F   # 5 bits  → bits 4-0
+    px16 = ((r << 11) | (g << 5) | b).astype("<u2")
+
+    # BMP rows must be padded to a 4-byte boundary
+    row_bytes  = w * 2
+    pad        = (4 - row_bytes % 4) % 4
+    pixel_size = (row_bytes + pad) * h
+
+    # File layout offsets
+    # BITMAPFILEHEADER = 14 B
+    # BITMAPINFOHEADER = 40 B
+    # BI_BITFIELDS masks = 12 B  (3 × 4 bytes)
+    offset    = 14 + 40 + 12
+    file_size = offset + pixel_size
+
+    # BITMAPFILEHEADER (14 bytes)
+    file_header = struct.pack("<2sIHHI", b"BM", file_size, 0, 0, offset)
+
+    # BITMAPINFOHEADER (40 bytes)
+    # biHeight is negative → top-down row order (no need to flip rows)
+    info_header = struct.pack(
+        "<IiiHHIIiiII",
+        40,          # biSize
+        w, -h,       # biWidth, biHeight  (negative = top-down)
+        1,           # biPlanes
+        16,          # biBitCount  ← THIS is what validators check
+        3,           # biCompression = BI_BITFIELDS (required for 16-bit)
+        pixel_size,  # biSizeImage
+        2835, 2835,  # biXPelsPerMeter, biYPelsPerMeter (~72 dpi)
+        0, 0,        # biClrUsed, biClrImportant
+    )
+
+    # RGB565 color channel bitmasks
+    masks = struct.pack("<III", 0xF800, 0x07E0, 0x001F)  # R, G, B
+
+    # Pixel data rows (top-down, each row padded to 4 bytes)
+    pad_bytes = b"\x00" * pad
+    rows = bytearray()
+    for y in range(h):
+        rows += px16[y].tobytes()
+        rows += pad_bytes
+
+    return file_header + info_header + masks + bytes(rows)
+
+
+def encode_bmp_24bit(img: Image.Image) -> bytes:
+    """Standard 24-bit BMP via Pillow."""
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="BMP")
     return buf.getvalue()
 
-def auto_compress(img: Image.Image, max_kb: int) -> tuple:
+
+def encode_bmp(img: Image.Image, bit_depth: int) -> bytes:
+    return encode_bmp_16bit(img) if bit_depth == 16 else encode_bmp_24bit(img)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CORE PIPELINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def auto_compress(img: Image.Image, max_kb: int, bit_depth: int) -> tuple:
+    """Iteratively downscale img until the encoded BMP fits within max_kb."""
     max_bytes = max_kb * 1024
-    current = img.copy()
+    cur = img.copy()
     compressed = False
     for _ in range(40):
-        bmp = to_bmp_bytes(current)
-        if len(bmp) <= max_bytes:
+        if len(encode_bmp(cur, bit_depth)) <= max_bytes:
             break
-        w, h = current.size
+        w, h = cur.size
         if w <= 8 or h <= 8:
             break
-        scale = (max_bytes / len(bmp)) ** 0.5 * 0.95
-        current = current.resize((max(8, int(w * scale)), max(8, int(h * scale))), Image.LANCZOS)
+        ratio = (max_bytes / len(encode_bmp(cur, bit_depth))) ** 0.5 * 0.95
+        cur = cur.resize((max(8, int(w * ratio)), max(8, int(h * ratio))), Image.LANCZOS)
         compressed = True
-    return current, compressed
+    return cur, compressed
 
-def process_image(img: Image.Image, cfg: dict) -> dict:
+
+def process_image(pil_img: Image.Image, cfg: dict) -> dict:
     steps = []
-    out = img.convert("RGB")
-    steps.append(f"Original: {out.width}×{out.height} px")
+    img = pil_img.convert("RGB")
+    steps.append(f"Original: {img.width}×{img.height} px")
 
-    # Step 1: Resize to target resolution
+    # 1. Resize to target resolution
     tw, th = cfg["width"], cfg["height"]
-    out = out.resize((tw, th), Image.LANCZOS)
+    img = img.resize((tw, th), Image.LANCZOS)
     steps.append(f"Resize → {tw}×{th} px")
 
-    # Step 2: Bit depth
-    if cfg["bit_depth"] == 16:
-        out = apply_rgb565(out)
-        steps.append("16-bit RGB565 applied")
-    else:
-        steps.append("24-bit (no depth reduction)")
-
-    # Step 3: Auto-compress
+    # 2. Auto-compress (before encoding, while still PIL Image)
     compressed = False
+    bd = cfg["bit_depth"]
     if cfg["max_kb"] > 0:
-        out, compressed = auto_compress(out, cfg["max_kb"])
+        img, compressed = auto_compress(img, cfg["max_kb"], bd)
         if compressed:
-            steps.append(f"Auto-compressed → {out.width}×{out.height} px")
+            steps.append(f"Auto-compressed → {img.width}×{img.height} px")
 
-    bmp = to_bmp_bytes(out)
-    final_kb = len(bmp) / 1024
-    steps.append(f"Final: {out.width}×{out.height} px  |  {final_kb:.1f} KB")
+    # 3. Encode to BMP bytes (16-bit or 24-bit)
+    bmp_bytes = encode_bmp(img, bd)
+    steps.append(f"Encoded as {bd}-bit {'RGB565' if bd == 16 else 'RGB'} BMP")
+
+    final_kb = len(bmp_bytes) / 1024
+    steps.append(f"Final: {img.width}×{img.height} px  |  {final_kb:.1f} KB")
 
     return {
-        "image": out,
-        "bmp_bytes": bmp,
-        "steps": steps,
-        "size_kb": final_kb,
-        "compressed": compressed,
+        "image":       img,        # PIL Image for preview
+        "bmp_bytes":   bmp_bytes,
+        "steps":       steps,
+        "size_kb":     final_kb,
+        "compressed":  compressed,
         "within_limit": final_kb <= cfg["max_kb"] if cfg["max_kb"] > 0 else True,
     }
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # UI
@@ -144,16 +207,18 @@ with st.expander("⚙️ Device & Conversion Settings", expanded=True):
         new_name = st.text_input("Nama preset", placeholder="e.g. My LCD 480x320")
         ca, cb = st.columns(2)
         with ca:
-            np_w = st.number_input("Width", 8, 4096, 480, key="np_w")
-            np_bd = st.selectbox("Bit depth", [16, 24], key="np_bd")
+            np_w  = st.number_input("Width",    8, 4096, 480, key="np_w")
+            np_bd = st.selectbox("Bit depth", [16, 24],  key="np_bd")
         with cb:
-            np_h = st.number_input("Height", 8, 4096, 320, key="np_h")
-            np_kb = st.number_input("Max KB", 0, 102400, 500, key="np_kb")
+            np_h  = st.number_input("Height",   8, 4096, 320, key="np_h")
+            np_kb = st.number_input("Max KB",   0, 102400, 500, key="np_kb")
         if st.button("💾 Simpan Preset", use_container_width=True):
             if new_name.strip():
                 st.session_state.presets[new_name.strip()] = {
-                    "width": int(np_w), "height": int(np_h),
-                    "bit_depth": int(np_bd), "max_kb": int(np_kb),
+                    "width":     int(np_w),
+                    "height":    int(np_h),
+                    "bit_depth": int(np_bd),
+                    "max_kb":    int(np_kb),
                 }
                 st.session_state.selected_preset = new_name.strip()
                 st.success(f"Preset '{new_name.strip()}' disimpan!")
@@ -166,12 +231,12 @@ with st.expander("⚙️ Device & Conversion Settings", expanded=True):
         cfg = st.session_state.presets[sel].copy()
         c1, c2 = st.columns(2)
         with c1:
-            cfg["width"]     = st.number_input("Target Width (px)", 8, 4096, cfg["width"], key="cw")
+            cfg["width"]     = st.number_input("Target Width (px)",  8, 4096, cfg["width"],  key="cw")
             cfg["bit_depth"] = st.selectbox("Bit Depth", [16, 24],
-                                index=0 if cfg["bit_depth"] == 16 else 1, key="cbd")
+                                            index=0 if cfg["bit_depth"] == 16 else 1, key="cbd")
         with c2:
-            cfg["height"]  = st.number_input("Target Height (px)", 8, 4096, cfg["height"], key="ch")
-            cfg["max_kb"]  = st.number_input("Max File Size (KB, 0 = no limit)", 0, 102400, cfg["max_kb"], key="ckb")
+            cfg["height"] = st.number_input("Target Height (px)", 8, 4096, cfg["height"], key="ch")
+            cfg["max_kb"] = st.number_input("Max File Size (KB, 0 = no limit)", 0, 102400, cfg["max_kb"], key="ckb")
 
         force_sq = st.checkbox("Force Square Resolution (W = H)", value=cfg["width"] == cfg["height"])
         if force_sq:
@@ -259,4 +324,4 @@ else:
     """, unsafe_allow_html=True)
 
 st.markdown("---")
-st.caption("Built with Streamlit & Pillow — RGB565 16-bit BMP Converter")
+st.caption("Built with Streamlit & Pillow — true 16-bit RGB565 BMP")
